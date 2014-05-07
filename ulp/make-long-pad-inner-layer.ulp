@@ -1,0 +1,164 @@
+#usage "en:This ULP generates for LONG and OFFSET pads the same diameter and shape in inner layers as it is in the outer layers.<p>"
+       "<nobr>EAGLE basically uses for all pads in <b>inner layers</b> a <b>round</b> pad shape.</nobr><br>"
+       "If you are using a LONG or OFFSET pad for a oblong soldering lug, and you have defined a slotted hole which "
+       "is drawn in layer 46, Milling, it is necessary to expand the pad in the inner layers with additional WIRE "
+       "segments. So the DRC is able to check possible conflicts with the slotted hole and polygons with a different "
+       "signal name can be calculated properly.<br>"
+       "If a pad is connected to a Supply layer, no such pad extension is generated.<br>"
+       "If an (or a list of) <b>Element-Name</b> is given, only an extended shape for this element is generated; "
+       "however, if no Element-Name is given extended shapes are generated for all long pads in this board.<p>"
+       "RUN make-long-pad-inner-layer [Element [Element] .. ]<br>"
+       "<p>"
+       "<author>Author: support@cadsoft.de</author>"
+       ,
+       "de:Dieses ULP generiert für LONG- und OFFSET-Pads für die Innenlagen die gleiche Größe und Form wie in den Aussenlagen.<p>"
+       "<nobr>EAGLE generiert grundsätzlich für Pads in <b>Innenlagen</b> eine <b>runde</b> Padform.</nobr><br>"
+       "Wird für längliche Lötanschlüsse (Lötfahnen) ein LONG- oder OFFSET-Pad benutzt und die Bohrung zusätzlich "
+       "geschlitzt, wobei die Fräskontur für den Längsschlitz im Layer 46 (Milling) definiert wird, so muß "
+       "in den Innenlagen das Pad zusätzlich mit WIRE-Segmenten erweitert werden. Dadurch kann der DRC evtl. Konflikte "
+       "mit dem Längsschlitz überprüfen bzw. ein Polygon mit fremden Signalnamen entsprechend freirechnen.<br>"
+       "Ist ein Pad mit einem Supply-Layer verbunden, wird keine Pad-Erweiterung generiert.<p>"
+       "Es gibt allerdings ein Problem bei Thermalstegen, da über das ULP nicht ohne weiteres erkannt werden kann "
+       "ob das Pad in diesem Layer an einer Kupferfläche über Thermalstege angeschlossen ist. "
+       "Diese Pads werden durch die Paderweiterung teilweise vollflächig angebunden.<br>"
+       "Bei Angabe eines (einer Liste von) <b>Bauteilnamen</b> werden nur für dieses (diese) Bauteil(e) die Paderweiterung erzeugt; "
+       "ohne Bauteilnamen wird bei allen Bauteilen, die LONG-Pads enthalten, die Paderweiterung erzeugt.<p>"
+       "RUN make-long-pad-inner-layer [Bauteilname [Bauteilname] .. ]<br>"
+       "<p>"
+       "<author>Autor: support@cadsoft.de</author>"
+
+
+string Version = "1.2"; // 1.0 2007.11.29  alf@cadsoft.de
+                        // 1.1 2008.01.08  check if connect with signal
+                        //                 generate error messages
+                        // 1.2 2008.01.15  Option - Element-Name list
+                        //                 check if schematic consistent
+
+string s;
+string cmd = "GRID mm;\nSET WIRE_BEND 2;\n";
+string error = "";
+int    usedLayer[];
+string nameLayer[];
+
+
+void err(string name, string padname, int x, int y) {
+  sprintf(s, "%s Pad %s (%.4f %.4f) mm : No signal connected\n",
+              name, padname, u2mm(x), u2mm(y) );
+  error += s;
+  return;
+}
+
+
+string checkname(string s) {      // check signal name, if name add ' '  2008.01.08 alf@cadsoft.de
+  if (s) sprintf(s, "'%s'", s);
+  return s;
+}
+
+
+int checkEname(string s) {
+  for (int n = 1; n < argc; n++ ) {
+    if (strupr(argv[n]) == s) return 1;
+  }
+  return 0;
+}
+
+
+if (board) {
+  if (dlgMessageBox(usage + "<p>Version " + Version, "OK", "Cancel") != 0) exit(-1);
+  board(B) {
+    B.layers(L) {
+      if (L.number < 16 & L.number > 1) {
+        if (L.used) {
+          usedLayer[L.number] = 1;
+          nameLayer[L.number] = L.name;
+        }
+      }
+    }
+    B.elements(E) {
+      if (!argv[1] || checkEname(E.name) ){
+        E.package.contacts(C) {
+          if (C.pad) {
+            string p, m;
+            real l;
+            if (C.pad.shape[16] == PAD_SHAPE_LONG) {
+              l = u2mm(C.pad.diameter[1]) * C.pad.elongation * 0.005;
+              sprintf(m, "MARK (%.4f %.4f);\n", u2mm(C.x), u2mm(C.y));
+              sprintf(s, "WIRE %s %.4f (R0 0) (P%.4f %0.1f);\n",
+                          checkname(C.pad.signal),
+                          u2mm(C.pad.diameter[1]),
+                          l, C.pad.angle
+                     );
+              p += s;
+              sprintf(s, "WIRE %s %.4f (R0 0) (P%.4f %.1f);\n",
+                          checkname(C.pad.signal),
+                          u2mm(C.pad.diameter[1]),
+                          l, C.pad.angle+180.0
+                     );
+              p += s;
+              if (!C.pad.signal) err(E.name, C.pad.name, u2mm(C.x), u2mm(C.y) );
+            }
+            else if (C.pad.shape[16] == PAD_SHAPE_OFFSET) {
+              real l = u2mm(C.pad.diameter[1]) * C.pad.elongation * 0.01;
+              sprintf(m, "MARK (%.4f %.4f);\n", u2mm(C.x), u2mm(C.y));
+              sprintf(s, "WIRE %s %.4f (R0 0) (P%.4f %0.1f);\n",
+                            checkname(C.pad.signal),
+                            u2mm(C.pad.diameter[1]),
+                            l, C.pad.angle
+                       );
+
+              p += s;
+              if (!C.pad.signal) err(E.name, C.pad.name, u2mm(C.x), u2mm(C.y) );
+            }
+            if (p) {
+              cmd += m;
+              for (int n = 2; n < 16; n++) {
+                if (usedLayer[n]) {
+                  if(nameLayer[n][0] == '$')  {  // check if supply layer
+                    if (strupr(strsub(nameLayer[n], 1)) == C.pad.signal) {
+                      ; // Singnal-Name == Supply-Layername
+                    }
+                    else {
+                      sprintf(s, "CHANGE LAYER %d;\n", n);
+                      cmd += s;
+                      cmd += p;
+                    }
+                  }
+                  else {
+                    sprintf(s, "CHANGE LAYER %d;\n", n);
+                    cmd += s;
+                    cmd += p;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  if (error) {  // check and view errors
+    string Message = "";
+    if (project.schematic) {
+      Message = "<font color=\"red\"><b>Consitent schematic is loaded!<br>First conect unconected Pins/Pads in schematic, please cancel.</b></font>";
+    }
+
+    dlgDialog("ERROR " + filename(argv[0])) {
+      dlgHBoxLayout dlgSpacing(400);
+      dlgHBoxLayout {
+        dlgVBoxLayout dlgSpacing(400);
+        dlgTextView(error);
+      }
+      dlgLabel("Can not place <b>Signal-Wires</b> on Pads without Signal-Name");
+      dlgLabel(Message);
+      dlgHBoxLayout {
+        dlgPushButton("OK") dlgAccept();
+        dlgPushButton("Cancel") { dlgReject(); exit(-1); }
+        dlgStretch(1);
+      }
+    };
+  }
+  cmd += "MARK;\nGRID LAST;\n";
+  exit(cmd);
+}
+
+else dlgMessageBox("Start this ULP in Board", "OK");

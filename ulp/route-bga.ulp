@@ -1,0 +1,1185 @@
+#usage "en: <b>BGA Escape Routing </b>"
+           "<p>"
+           "Usage: run route-bga element"
+           "<p>"
+           "<author>Author: support@cadsoft.de</author>"
+
+// THIS PROGRAM IS PROVIDED AS IS AND WITHOUT WARRANTY OF ANY KIND, EXPRESSED OR IMPLIED
+
+#require 6.0000
+
+string Version = "1.0";
+
+//======================================================================================
+// Include
+enum { false = 0, true = 1 };
+
+// Debug stuff
+
+int Dbg = 0;
+string DbgMsg, DbgTxt, DbgFile;
+
+void DbgInit() {
+   if (Dbg) {
+      output(DbgFile, "wt") printf("");
+      DbgTxt = "";
+   }
+}
+
+void DbgDump() {
+   if (Dbg) {
+      output(DbgFile, "wba") printf(DbgTxt);
+      DbgTxt = "";
+   }
+}
+
+// General utilities
+int Sgn(int i) {
+   return (i > 0) ? 1 : (i < 0) ? -1 : 0;
+}
+
+string I2Str(int i) {
+   string str;
+   sprintf(str, "%d", i);
+   return str;
+}
+
+// nrDigits: number of digits after dot/comma
+string R2Str(real r, int nrDigits) {
+   string str;
+   sprintf(str, "%." + I2Str(nrDigits) + "f", r);
+   return str;
+}
+
+int Str2U(string s) {
+   if (strstr(s, "mm") > 0) return int(strtod(s) * 10000 * 32);
+   if (strstr(s, "mil") > 0) return int(strtod(s) * 10 * 32 * 25.4);
+   if (strstr(s, "in") > 0) return int(strtod(s) * 10000 * 32 * 25.4);
+   if (strstr(s, "mic") > 0) return int(strtod(s) * 10 * 32);
+   dlgMessageBox("Unknown unit ! Cannot convert.");
+   return 0;
+}
+
+// Language support for dialogs: German/English
+// Please keep to alphabetic sorting for better maintainability !
+
+string Dictionary[] = {
+  "en\v"
+  "de\v",
+  "All contacts\v"
+  "Alle Kontakte\v",
+  "BGA analysis for \v"
+  "BGA-Analyse von \v",
+  "Cancel\v"
+  "Beenden\v",
+  "Contact diameter: \v"
+  "Kontakt-Durchmesser: \v",
+  "Contact distance: \v"
+  "Kontakt-Abstand: \v",
+  "Contacts not completely circular (Roundness < 99%) !\v"
+  "Kontakte nicht vollständig kreisförmig (Rundheit < 99%) !\v",
+  "Contacts with signals\v"
+  "Kontakte mit Signalen\v",
+  "Coverage\v"
+  "Abdeckung\v",
+  "Deviation of SMD dimensions\v"
+  "Unterschiedliche SMD-Grössen !\v",
+  "Element contains non SMD contacts !\v"
+  "Element enthält Nicht-SMD-Kontakte !\v",
+  "Escape distance: \v"
+  "Escape-Distanz: \v",
+  "Help\v"
+  "Hilfe\v",
+  "Make bones\v"
+  "Knochentechnik\v",
+  "Maximum via drill for bone technique: \v"
+  "Maximaler Via-Durchmesser für die Knochentechnik: \v",
+  "Maximum wire width for one wire between contacts: \v"
+  "Maximale Wire-Breite für eine Bahn zwischen den Kontakten: \v",
+  "Micro via drill size:\v"
+  "Micro-Via-Durchmesser:\v",
+  "Not enough space for vias between contacts. \v"
+  "Nicht ausreichend Platz für Vias zwischen den Kontakten. \v",
+  "Not enough space for wires between contacts. \v"
+  "Nicht ausreichend Platz für Wires zwischen den Kontakten. \v",
+  "not found\v"
+  "nicht gefunden\v",
+  "Number of contacts: \v"
+  "Anzahl von Kontakten: \v",
+  "Please start from Layout editor !\v"
+  "Bitte starten Sie vom Layout-Editor aus !\v",
+  "Processing %d of %d contacts\v"
+  "Bearbeite %d von %d Kontakten\v",
+  "Stacked micro vias:\v"
+  "Stacked Micro-Vias:\v",
+  "Stacked micro vias recommended !\v"
+  "Empfehlung von Stacked Micro-Vias !\v",
+  "Use net classes\v"
+  "Netzklassen verwenden\v",
+  "Use specific sizes:\v"
+  "Spezifische Grössen verwenden:\v",
+  "with signals\v"
+  "mit Signalen\v",
+  "Via drill size:\v"
+  "Via-Durchmesser:\v",
+  "Via strategy\v"
+  "Via-Strategie\v",
+  "Wire and via sizes:\v"
+  "Wire- und Via-Grössen:\v",
+  "Wire width:\v"
+  "Wire-Breite:\v"
+};
+
+string DlgLang = language();
+if (DlgLang != "de") DlgLang = "en";
+int LangIdx = strstr(Dictionary[0], DlgLang) / 3;
+
+// Translate, based on dictionary
+string tr(string s) {
+   string t = lookup(Dictionary, s, LangIdx, '\v');
+   return (t != "") ? t : s;
+}
+// End include
+//==============================================================================
+
+//==============================================================================
+// Globals
+//==============================================================================
+
+// Constants
+//----------
+
+// States of grid points
+enum { NEAR_WIRE    = 1,
+       NEAR_VIA     = 2,
+       WIRE         = 3,
+       VIA          = 4,
+       CON          = 1 << 3,
+       VISITED      = 1 << 4
+
+    };
+enum { ROUTE_MASK = 0x7 };
+
+// Dimensions
+enum { DIM_X, DIM_Y };
+
+enum { INVALID_POS = -1 };
+
+// Via strategies
+enum { BONES = 0, STACKED_VIAS = 1 };
+// Route modes
+enum { ESCAPE, INTERNAL };
+
+// Variables
+//----------
+
+// DRU stuff
+int ExpDRUs = true;
+string DruFile;
+// Not adjusted
+int MinWireWire, MinWirePad, MinWireVia, MinPadVia, MinViaVia;
+// Used as minimums
+int MinWireWidth;
+int MinViaDrill, MinMicroViaDrill;
+// Restring stuff
+real RestFacVia, RestFacMicroVia;
+int RestMinVia, RestMaxVia, RestMinMicroVia, RestMaxMicroVia;
+int NrLayers, Layers[];
+
+int EscapeDist = 5 * 10000 * 32; // 5 mm
+
+int Dialog = true;
+string ScrFile;
+int ExtUnit;
+string ExtUnitName;
+string ElemNames[];
+int NrElems;
+
+real Lbr2BrdRot[] = { 1, 0,
+                      0, 1 };
+int ElemX, ElemY;
+
+int WireWidth;
+int ViaDrill, ViaDiam;
+int MicroViaDrill, MicroViaDiam;
+
+// Net classes
+int UseNetClasses = false;
+int MaxNetClassId;
+int ClassAdjWidths[], ClassAdjDrills[], ClassClearances[];
+
+// BGA specific
+//-------------
+// Element as whole
+string ElemName;
+real ElemAngle;
+int ElemMirror;
+int NrNewSig;
+int ElemViaStrat = BONES;  //STACKED_VIAS;
+int ElemRouteAll = false;
+
+// Contacts
+int ConXMin, ConYMin;
+int NrCons, NrConsX, NrConsY, NrConsWithSig;
+string ConSigNames[];
+int ConXs[], ConYs[], ConClassIds[], ConIdxs[];
+// Corresponding coords of lbr package
+int LbrPacConXs[], LbrPacConYs[];
+int ConDist, ConDiam;
+
+int MaxWireWidth1, MaxViaDrill;
+
+// Grid Matrix
+int NrGrid, NrGridX, NrGridY, GridStates[];
+int GridOriginX, GridOriginY;
+int GridDist;
+int GridMultiple = 1;
+// Only calculated and relevant if more than one wire between contacts:
+//  - Distance from contact middle to next possible wire middle.
+int GridConMWireM;
+//  - Distance from wire middle to neighboring wire middle
+real GridWireMWireM;
+
+// Matrix of allowed transitions
+//  - Number of states relevant for routing through/beside them
+int NrOccStates = 6;
+int Allowed[] = { true, true,  true,  true,   true,  true,  // NEAR_VIA
+                  true, true,  true,  true,   true,  true,  // NEAR_WIRE
+                  true, false, false, false, false, false,  // WIRE
+                  true, false, true,  false, false, false };// VIA
+// The index position for contact in the Allowed-Matrix.
+int AllowedIdxCon = 5;
+
+// Current states while traversing grid
+int CurTraverse;
+int CurGridX, CurGridY;
+//int CurRouteDir;
+int CurIncX, CurIncY;
+int CurEscaped;
+
+int PrevTryIncI, PrevTryIncJ; // PrevStepMode ?
+int CurRouteMode;
+int CurDeltaI, CurDeltaJ;
+int CurTryIncI[], CurTryIncJ[], CurNrTries;  // Optimize with CurStepModes[3] ?
+int CurTakeBone;
+int CurBoneX, CurBoneY;
+
+// Escape trials
+int TryI, TryJ;
+
+//==============================================================================
+// Functions
+//==============================================================================
+
+int ExtU2U(real x) {
+   return (ExtUnit == GRID_UNIT_MM)   ? mm2u(x)   :
+          (ExtUnit == GRID_UNIT_INCH) ? inch2u(x) :
+          (ExtUnit == GRID_UNIT_MIC)  ? mic2u(x)  : mil2u(x);
+}
+
+real U2ExtU(int x) {
+   return (ExtUnit == GRID_UNIT_MM)   ? u2mm(x)   :
+          (ExtUnit == GRID_UNIT_INCH) ? u2inch(x) :
+          (ExtUnit == GRID_UNIT_MIC)  ? u2mic(x)  : u2mil(x);
+}
+
+string U2ExtUStr(int u) {
+   return R2Str(U2ExtU(u), 3) + ExtUnitName;
+}
+
+int GetViaDiam(int drill) {
+   return drill + min(max(RestFacVia * drill, RestMinVia), RestMaxVia) * 2;
+}
+
+void GetDesignParams() {
+   // Read relevant design rule parameters:
+   string lines[], laySetupStr;
+   int nrLines = fileread(lines, DruFile);
+   if (nrLines == 0) {
+      dlgMessageBox("Error reading design rules !");
+      exit(EXIT_FAILURE);
+   }
+   for (int i = 0; i < nrLines; ++i) {
+      string words[];
+      int nrWords = strsplit(words, lines[i], ' ');
+      if (nrWords < 3) continue;    // Empty line or some other stuff
+      string keyword = words[0];
+      if      (keyword == "mdWireWire") MinWireWire = Str2U(words[2]);
+      else if (keyword == "mdWirePad") MinWirePad = Str2U(words[2]);
+      else if (keyword == "mdWireVia") MinWireVia = Str2U(words[2]);
+      else if (keyword == "mdPadVia") MinPadVia = Str2U(words[2]);
+      else if (keyword == "mdViaVia") MinViaVia = Str2U(words[2]);
+      else if (keyword == "msWidth") MinWireWidth = Str2U(words[2]);
+      else if (keyword == "layerSetup") laySetupStr = words[2];
+      else if (keyword == "msDrill") MinViaDrill = Str2U(words[2]);
+      else if (keyword == "rvViaOuter") RestFacVia = strtod(words[2]);
+      else if (keyword == "rlMinViaOuter") RestMinVia = Str2U(words[2]);
+      else if (keyword == "rlMaxViaOuter") RestMaxVia = Str2U(words[2]);
+      else if (keyword == "msMicroVia") MinMicroViaDrill = Str2U(words[2]);
+      else if (keyword == "rvMicroViaOuter") RestFacMicroVia = strtod(words[2]);
+      else if (keyword == "rlMinMicroViaOuter") RestMinMicroVia = Str2U(words[2]);
+      else if (keyword == "rlMaxMicroViaOuter") RestMaxMicroVia = Str2U(words[2]);
+   }
+   // Evaluate LayerSetup-String:
+   for (int j = 1; j <= 16; ++j) {
+      string layStr;
+      sprintf(layStr, "[\\D]%d[\\D]", j);
+      if (strxstr(laySetupStr, layStr) != -1) {
+         Layers[NrLayers++] = j;
+         if (Dbg) { sprintf(DbgMsg, "Layer %d\n", Layers[NrLayers -1]); DbgTxt += DbgMsg; }
+      }
+   }
+   WireWidth = MinWireWidth;
+   ViaDrill = MinViaDrill;
+   MicroViaDrill = min(MinMicroViaDrill, MinViaDrill);
+   if (Dbg) {
+      sprintf(DbgMsg, "DRU Params: MinWireWire %f MinWirePad %f MinWireVia %f MinPadVia %f MinViaVia %f\n",
+              u2mm(MinWireWire), u2mm(MinWirePad), u2mm(MinWireVia), u2mm(MinPadVia), u2mm(MinViaVia));
+      DbgTxt += DbgMsg;
+   }
+}
+
+int GridState(int lay, int i, int j) {
+    return (i >= 0 && i < NrGridX && j >= 0 && j < NrGridY) ? GridStates[lay * NrGrid + i * NrGridY + j]: 0;
+}
+
+int GridHasState(int lay, int i, int j, int state) {
+   return GridStates[lay * NrGrid + i * NrGridY + j] & state;
+}
+
+// Not valid for route states !
+void SetGridState(int lay, int i, int j, int state) {
+   GridStates[lay * NrGrid + i * NrGridY + j] |= state;
+}
+
+void SetGridRouteState(int lay, int i, int j, int state) {
+   if (i >= 0 && i < NrGridX && j >= 0 && j < NrGridY)
+      GridStates[lay * NrGrid + i * NrGridY + j] = (GridStates[lay * NrGrid + i * NrGridY + j] & ~ROUTE_MASK) | state;
+}
+
+int GridCoord(int k, int dim) {
+   if (GridMultiple <= 2)
+      return (dim == DIM_X ? GridOriginX : GridOriginY) + k * GridDist;
+   // If more than 1 trace fits between it's not so obvious...
+   int r = k % GridMultiple - 1;
+   int between = (r > -1) ? GridConMWireM + r * GridWireMWireM : 0;
+   return (dim == DIM_X ? GridOriginX : GridOriginY) + k / GridMultiple * ConDist + between;
+}
+
+int LbrGrid2BrdCoord(int i, int j, int dim) {
+   int elemCoord = (dim == DIM_X) ? ElemX : ElemY;
+   int rowOffs =   (dim == DIM_X) ? 0 : 2;                                          // LbrPacX = LbrPac = 0
+   return round(Lbr2BrdRot[rowOffs] * GridCoord(i, DIM_X) + Lbr2BrdRot[rowOffs + 1] * GridCoord(j, DIM_Y)) + elemCoord;
+}
+
+void SetupElement(string elemName) {
+   int err = false, errRound = false, errType = false, errSize = false;
+   int found = false;
+   int roundTol = 1; // Perhaps check this out more detailed !
+   int conXMax = INT_MIN, conYMax = INT_MIN;
+   int conDiamMin = INT_MAX, conDiamMax = INT_MIN;   // Checking radius deviations
+   int conDistMin = INT_MAX, conDistMax = INT_MIN;   // Checking distance deviations
+
+   ElemName = elemName;
+   NrNewSig = 0;
+   NrCons = 0;
+   ConDist = INT_MAX;
+   ConXMin = INT_MAX, ConYMin = INT_MAX;
+   if (Dbg) DbgTxt += "SetupElement:\n";
+
+   // Find element and package of according library
+   board(B) {
+      string lbrName, pacName;
+      B.elements(E)
+         if (E.name == elemName) {
+            found = true;
+            lbrName = E.package.library;
+            pacName = E.package.name;
+            // Params for xform
+            ElemX = E.x;
+            ElemY = E.y;
+            ElemMirror = E.mirror;
+            ElemAngle = E.angle / 180 * PI;  // Bogenmass !
+            Lbr2BrdRot[0] = cos(ElemAngle);
+            Lbr2BrdRot[1] =-sin(ElemAngle);
+            Lbr2BrdRot[2] = sin(ElemAngle);
+            Lbr2BrdRot[3] = cos(ElemAngle);
+            if (Dbg) {
+               sprintf(DbgMsg, "angle, Rot: %f,  (%f %f %f %f)\n", E.angle, Lbr2BrdRot[0], Lbr2BrdRot[1] ,Lbr2BrdRot[2] ,Lbr2BrdRot[3]);
+               DbgTxt += DbgMsg;
+            }
+            E.package.contacts(C) {
+               ConXs[NrCons] = C.x;
+               ConYs[NrCons] = C.y;
+               ConSigNames[NrCons] = C.signal;
+               if (C.signal != "") ++NrConsWithSig;
+               if (Dbg) { sprintf(DbgMsg, "Elem: (%f %f)\n", u2mm(ConXs[NrCons]), u2mm(ConYs[NrCons]));  DbgTxt += DbgMsg; }
+               ++NrCons;
+            }
+            break;
+         }
+      if (!found) {
+         dlgMessageBox("Element " + elemName + " " + tr("not found") + "!");
+         exit(EXIT_FAILURE);
+      }
+      found = false;
+      B.libraries(L) if (!found && L.name == lbrName)
+         L.packages(PAC) if (PAC.name == pacName) {
+            found = true;
+            int i;
+            PAC.contacts(C) {
+               LbrPacConXs[i] = C.x;
+               LbrPacConYs[i++] = C.y;
+               // Get grid dimensions
+               ConXMin = min(ConXMin, C.x);
+               conXMax = max(conXMax, C.x);
+               ConYMin = min(ConYMin, C.y);
+               conYMax = max(conYMax, C.y);
+               if (Dbg) { sprintf(DbgMsg, "LbrPac: (%f %f)\n", u2mm(LbrPacConXs[i-1]), u2mm(LbrPacConYs[i-1]));  DbgTxt += DbgMsg; }
+               if (C.smd) {
+                  ConDiam = C.smd.dx;
+                  if (C.smd.dx != C.smd.dy || 100 - C.smd.roundness > roundTol)
+                     errRound = true;
+                  conDiamMin = min(conDiamMin, C.smd.dx);
+                  conDiamMax = max(conDiamMax, C.smd.dx);
+                  if (conDiamMin != conDiamMax)
+                     errSize = true;
+               }
+               else {
+                  errType = true;
+                  break;
+               }
+            }
+            break;
+         }
+   }
+
+   // Error conditions:
+   if (errSize) dlgMessageBox(tr("Deviation of SMD sizes ") + " ! " + "Minimum = " +
+                              U2ExtUStr(conDiamMin) + ", Maximum = " + U2ExtUStr(conDiamMax));
+   if (errType) dlgMessageBox(tr("Element contains non SMD contacts !"));
+   if (errRound) dlgMessageBox(tr("Contacts not completely circular !"));
+   if (errSize || errType || errRound)
+      exit(EXIT_FAILURE);
+
+   ConDiam = (conDiamMin + conDiamMax) / 2;  // Tolerant approach. Tolerances tbd.
+   sort(NrCons, ConIdxs, LbrPacConXs, LbrPacConYs);
+   // Calc contact distance.
+   for (int i = 1, curX = LbrPacConXs[ConIdxs[0]]; i < NrCons; ++i) {
+      if (LbrPacConXs[ConIdxs[i]] == curX)
+         ConDist = min(ConDist, LbrPacConYs[ConIdxs[i]] - LbrPacConYs[ConIdxs[i - 1]]);
+      else {
+         ConDist = min(ConDist, LbrPacConXs[ConIdxs[i]] - curX);
+         curX = LbrPacConXs[ConIdxs[i]];
+      }
+   }
+   if (Dbg) DbgDump();
+
+   real rNrConsX = real(conXMax - ConXMin) / ConDist + 1;
+   real rNrConsY = real(conYMax - ConYMin) / ConDist + 1;
+   NrConsX = round(rNrConsX);
+   NrConsY = round(rNrConsY);
+   if (Dbg) {
+      real dbgEpsX = abs(rNrConsX - NrConsX);
+      real dbgEpsY = abs(rNrConsY - NrConsY);
+      sprintf(DbgMsg, "Deviation NrConsX/Y: %.7f %.7f\n", dbgEpsX, dbgEpsY);  DbgTxt += DbgMsg;
+      DbgDump();
+   }
+   MaxWireWidth1 = max(ConDist - ConDiam - 2 * MinWirePad, 0);
+   int viaDiam = sqrt(2) * ConDist - ConDiam - 2 * MinPadVia;
+   MaxViaDrill = max(max(min(viaDiam / (1 + 2 * RestFacVia), viaDiam - 2 * RestMinVia), viaDiam - 2 * RestMaxVia), 0);
+}
+
+void IncludeClasses() {
+   string sigNames[];
+   int sigClassIds[], nrSigs;
+   board(B) {
+      int maxNetClassId;
+      B.classes(C) if (C.name != "") {
+         // Adjustment:
+         ClassAdjWidths[C.number] = max(C.width, MinWireWidth);
+         ClassAdjDrills[C.number] = max(C.drill, MinViaDrill); // CalcViaDiam
+         ClassClearances[C.number] = C.clearance;
+         if (Dbg) {
+            sprintf(DbgMsg, "C.number %d C.width %f C.drill %f C.clearance %f\n",
+                    C.number, u2mm(C.width), u2mm(C.drill), u2mm(C.clearance));
+            DbgTxt += DbgMsg;
+         }
+         maxNetClassId = max(maxNetClassId, C.number);
+      }
+      // Incorporate class widths, drills etc. in design parameters.
+      ViaDiam = GetViaDiam(MinViaDrill);
+      for (int i = 0; i < maxNetClassId; ++i) {
+         WireWidth = max(WireWidth, ClassAdjWidths[i]);
+         ViaDiam = max(ViaDiam, GetViaDiam(ClassAdjDrills[i]));
+         MinWireWire = max(MinWireWire, ClassClearances[i]);
+         MinWirePad = max(MinWirePad, ClassClearances[i]);
+         MinWireVia = max(MinWireVia, ClassClearances[i]);
+         MinViaVia = max(MinViaVia, ClassClearances[i]);
+         MinPadVia = max(MinPadVia, ClassClearances[i]);
+      }
+      // Collect BGA's signals and classes
+      B.signals(S)
+         S.contactrefs(CR)
+            if (CR.element.name == ElemName) {
+               sigNames[nrSigs] = S.name;
+               sigClassIds[nrSigs++] = S.class.number;
+               if (Dbg) {
+                  sprintf(DbgMsg, "BGA-Signal: %s %d\n", sigNames[nrSigs - 1], sigClassIds[nrSigs - 1]);
+                  DbgTxt += DbgMsg;
+               }
+               break;
+            }
+   }
+   for (int i = 0; i < NrCons; ++i)
+      if (ConSigNames[i] != "")
+         for (int j = 0; j < nrSigs; ++j)
+            if (sigNames[j] == ConSigNames[i]) {
+               ConClassIds[i] =  sigClassIds[j];
+               if (Dbg) {
+                  sprintf(DbgMsg, "Con->ClassId: %d %d\n", i, ConClassIds[i]);
+                  DbgTxt += DbgMsg;
+               }
+               break;
+            }
+   DbgDump();
+}
+
+void InitGrid() {
+   if (Dbg) {
+      sprintf(DbgMsg, "InitGrid: ViaDiam %f MicroViaDiam %f WireWidth %f \n"
+                      "MinWireWire %f MinWirePad %f MinWireVia %f MinViaVia %f MinPadVia %f\n",
+                      u2mm(ViaDiam), u2mm(MicroViaDiam), u2mm(WireWidth), u2mm(MinWireWire),
+                      u2mm(MinWirePad), u2mm(MinWireVia), u2mm(MinViaVia), u2mm(MinPadVia));
+      DbgTxt += DbgMsg;
+   }
+   // Nr traces between contacts:
+   int freeWidth = ConDist - ConDiam - 2 * MinWirePad - WireWidth;
+   if (freeWidth >= 0) {
+      GridMultiple = 2;
+      // In this case we support more than 1 trace between !
+      if (ElemViaStrat == STACKED_VIAS)
+         GridMultiple += freeWidth / (WireWidth + MinWireWire);
+   }
+   if (GridMultiple <= 2) GridDist = ConDist / GridMultiple;
+   else {
+      GridConMWireM = ConDiam / 2 + MinWirePad + WireWidth / 2;
+      GridWireMWireM = real(freeWidth) / (GridMultiple - 2);
+   }
+   NrGridX = (NrConsX - 1) * GridMultiple + 1;
+   NrGridY = (NrConsY - 1) * GridMultiple + 1;
+   NrGrid = NrGridX * NrGridY;
+   GridOriginX = ConXMin;
+   GridOriginY = ConYMin;
+
+   if (Dbg) {
+      sprintf(DbgMsg, "GridMultiple %d GridDist %f NrGridX %d NrGridY %d \nGridOriginX %f GridOriginY %f\n",
+             GridMultiple, u2mm(GridDist), NrGridX, NrGridY, u2mm(GridOriginX), u2mm(GridOriginY));
+      DbgTxt += DbgMsg; DbgDump();
+   }
+
+   int nrTotal = NrGrid * NrLayers;
+   for (int i = nrTotal - 1; i >= 0; --i) GridStates[i] = 0; // Faster initialisation this way...
+   for (int k = 0; k < NrCons; ++k) {
+      int i = round(real(LbrPacConXs[k] - GridOriginX) / ConDist * GridMultiple);
+      int j = round(real(LbrPacConYs[k] - GridOriginY) / ConDist * GridMultiple);
+      SetGridState(0, i, j, CON);
+   }
+   Allowed[NrOccStates * (NEAR_WIRE - 1) + AllowedIdxCon] = (GridDist * sqrt(2) >= ConDiam + MinWirePad * 2 + WireWidth);
+   Allowed[NrOccStates * (VIA - 1) + NEAR_VIA] = (GridDist >= ViaDiam + MinViaVia);
+   Allowed[NrOccStates * (NEAR_VIA - 1) + VIA] = Allowed[NrOccStates * (VIA - 1) + NEAR_VIA];
+   Allowed[NrOccStates * (NEAR_VIA - 1) + AllowedIdxCon] = (GridDist >= ViaDiam / 2 + ConDiam / 2 + MinPadVia);
+   Allowed[NrOccStates * (NEAR_VIA - 1) + WIRE] = (GridDist >= ViaDiam / 2 + WireWidth / 2 + MinWireVia);
+   // Leads to diagonal problem !
+   //Allowed[NrOccStates * (WIRE - 1) + NEAR_VIA] = Allowed[NrOccStates * (NEAR_VIA - 1) + WIRE];
+   if (Dbg) {
+      sprintf(DbgMsg,"NEAR_WIRE -> CON: GridDist * sqrt(2) %f <-> %f\n",
+              u2mm(int(GridDist * sqrt(2))), u2mm(ConDiam + MinWirePad * 2 + WireWidth)); DbgTxt += DbgMsg;
+      sprintf(DbgMsg,"NEAR_VIA -> CON: ViaDiam / 2 + ConDiam / 2 + MinPadVia: %f\n",
+              u2mm(ViaDiam / 2 + ConDiam / 2 + MinPadVia)); DbgTxt += DbgMsg;
+      sprintf(DbgMsg,"WIRE -> NEAR_VIA: ViaDiam / 2 + WireWidth / 2 + MinWireVia: %f\n",
+              u2mm(ViaDiam / 2 + WireWidth / 2 + MinWireVia)); DbgTxt += DbgMsg;
+
+      sprintf(DbgMsg,"Allowed-Matrix:\n"); DbgTxt += DbgMsg;
+      for (int i = 0; i<4; ++i) {
+         sprintf(DbgMsg,"%d %d %d %d %d %d\n", Allowed[NrOccStates * i], Allowed[NrOccStates * i + 1],
+                                               Allowed[NrOccStates * i + 2], Allowed[NrOccStates * i + 3],
+                                               Allowed[NrOccStates * i + 4], Allowed[NrOccStates * i + 5]);
+         DbgTxt += DbgMsg;
+      }
+      DbgDump();
+   }
+}
+
+int AllowedTransition(int curState, int newRouteState) {
+   int allowed = (curState & CON) ? Allowed[NrOccStates * (newRouteState - 1) + AllowedIdxCon] : true;
+   if (allowed) {
+      int routeState = curState & ROUTE_MASK; // 3 bit !
+      if (routeState != 0)
+         allowed = Allowed[NrOccStates * (newRouteState - 1) + routeState];
+   }
+   if (Dbg) { sprintf(DbgMsg, "AllowedTransition: %d -> %d: %d\n", curState, newRouteState, allowed); DbgTxt += DbgMsg; }
+   return allowed;
+}
+
+int Layer(int i) {
+   return ElemMirror ? Layers[NrLayers - 1 - i] : Layers[i];
+}
+
+int ConIdx(int i, int j) {
+   if (Dbg) { sprintf(DbgMsg, "ConIdx: i %d j %d\n", i, j); DbgTxt += DbgMsg; }
+   if ((i % GridMultiple != 0) || (j % GridMultiple != 0)) return -1;
+   int x = GridOriginX + round(ConDist * i / GridMultiple);  // ! oder ConXs/Y - Arrays ersetzen !
+   int y = GridOriginY + round(ConDist * j / GridMultiple);
+   for (int k = 0; k < NrCons; ++k)
+      if ((LbrPacConXs[ConIdxs[k]] == x) && (LbrPacConYs[ConIdxs[k]] == y)) {
+         if (Dbg) { sprintf(DbgMsg, "ConIdx return: %d\n", ConIdxs[k]); DbgTxt += DbgMsg; }
+         return ConIdxs[k];
+      }
+      else if (LbrPacConXs[ConIdxs[k]] > x) {
+         if (Dbg) DbgTxt += "LbrPacConXs[ConIdxs[k]] > x !";
+         return -1;
+      }
+   return -1;
+}
+
+string NewSigName() {
+  string newSigName;
+  sprintf(newSigName, "%s-%d", ElemName, ++NrNewSig); //IC2-34. Alternative: IC2-i-j, i,j Kontaktpos.
+  return newSigName;
+}
+
+int BorderDist(int i, int j) {
+   return min(min(i, NrGridX - 1 - i), min(j, NrGridY - 1 - j));
+}
+
+void TurnLeft() {
+   if (Dbg) { sprintf(DbgMsg, "TurnLeft: before: (%d %d) (%d %d)\n", CurDeltaI, CurDeltaJ, CurIncX, CurIncY); DbgTxt += DbgMsg; }
+   int oldDeltaI = CurDeltaI, oldIncX = CurIncX;
+   CurDeltaI = -CurDeltaJ;
+   CurDeltaJ =  oldDeltaI;
+   CurIncX = -CurIncY;
+   CurIncY =  oldIncX;
+   if (Dbg) { sprintf(DbgMsg, "TurnLeft: after: (%d %d) (%d %d)\n", CurDeltaI, CurDeltaJ, CurIncX, CurIncY); DbgTxt += DbgMsg; }
+}
+
+int SetNextPos() {
+   if (Dbg) { sprintf(DbgMsg, "SetNextPos: before: %d %d\n", CurGridX, CurGridY); DbgTxt += DbgMsg; DbgDump(); }
+   if (!CurTraverse) {
+      CurGridX = 0;
+      CurGridY = NrGridY - 1;
+      // Route to left, traverse down
+      CurDeltaI = -1;
+      CurDeltaJ = 0;
+      CurIncX = 0;
+      CurIncY = -1;
+      SetGridState(0, CurGridX, CurGridY, VISITED);
+      CurTraverse = true;
+      return true;
+   }
+   int turn1 = false;
+   if (GridHasState(0, CurGridX + CurIncX, CurGridY + CurIncY, VISITED)) {
+      TurnLeft();
+      turn1 = true;
+   }
+   CurGridX += CurIncX;
+   CurGridY += CurIncY;
+   if (!turn1 && min(CurGridX, NrGridX - 1 - CurGridX) == min(CurGridY, NrGridY - 1 - CurGridY))
+      TurnLeft();
+   if (GridHasState(0, CurGridX, CurGridY, VISITED))
+      CurGridX = CurGridY = INVALID_POS;
+   else
+      SetGridState(0, CurGridX, CurGridY, VISITED);
+   if (Dbg) { sprintf(DbgMsg, "SetNextPos: after: %d %d\n", CurGridX, CurGridY); DbgTxt += DbgMsg; DbgDump(); }
+   return (CurGridX != INVALID_POS);
+}
+
+int SetNextConPos() {
+   while (SetNextPos() && !(GridHasState(0, CurGridX, CurGridY, CON) &&
+          (ElemRouteAll || ConSigNames[ConIdx(CurGridX, CurGridY)] != "")));
+   CurEscaped = false;
+   CurTakeBone = false;
+   CurRouteMode = ESCAPE;
+   return (CurGridX != INVALID_POS);
+}
+
+int IsBorder(int i, int j) {
+   return (i == 0) || (i == NrGridX - 1) || (j == 0) || (j == NrGridY - 1);
+}
+
+int TryRoute(int lay, int i, int j, int incX, int incY, int routeType, int singleStep) {
+   if (Dbg) {
+      sprintf(DbgMsg, "Try start: i %d j %d incX %d inc Y %d type %d\n", i,j,incX,incY,routeType);
+      DbgTxt += DbgMsg; DbgDump();
+   }
+   TryI = i;
+   TryJ = j;
+   while (true) {
+      if (IsBorder(TryI, TryJ) || !AllowedTransition(GridState(lay, TryI + incX, TryJ + incY), routeType)) break;
+      if (routeType == VIA) {
+          if (incX == 0) {
+             if (!(AllowedTransition(GridState(lay, TryI - 1, TryJ + incY), NEAR_VIA) &&
+                   AllowedTransition(GridState(lay, TryI + 1, TryJ + incY), NEAR_VIA) &&
+                   AllowedTransition(GridState(lay, TryI, TryJ + 2 * incY), NEAR_VIA))) break;
+          }
+          else if (incY == 0) {
+             if (!(AllowedTransition(GridState(lay, TryI + incX, TryJ - 1), NEAR_VIA) &&
+                   AllowedTransition(GridState(lay, TryI + incX, TryJ + 1), NEAR_VIA) &&
+                   AllowedTransition(GridState(lay, TryI + 2 * incX, TryJ), NEAR_VIA))) break;
+          }
+          else if (!(AllowedTransition(GridState(lay, TryI + incX - 1, TryJ + incY    ), NEAR_VIA) &&
+                     AllowedTransition(GridState(lay, TryI + incX    , TryJ + incY - 1), NEAR_VIA) &&
+                     AllowedTransition(GridState(lay, TryI + incX + 1, TryJ + incY    ), NEAR_VIA) &&
+                     AllowedTransition(GridState(lay, TryI + incX    , TryJ + incY + 1), NEAR_VIA))) break;
+      }
+      else if ((incX * incY != 0) &&
+               !(AllowedTransition(GridState(lay, TryI       , TryJ + incY), NEAR_WIRE) &&
+                 AllowedTransition(GridState(lay, TryI + incX, TryJ       ), NEAR_WIRE))) break;
+      TryI += incX;
+      TryJ += incY;
+      if (singleStep) break;
+   }
+   CurEscaped = IsBorder(TryI, TryJ);
+   if (Dbg) { sprintf(DbgMsg, "Try end: TriI %d TryJ %d\n", TryI, TryJ); DbgTxt += DbgMsg; DbgDump(); }
+   return CurEscaped || (TryI != i) || (TryJ != j);
+}
+
+void SetNextSteps() {
+   if (CurRouteMode == ESCAPE) {
+      int prevI = (PrevTryIncI == 0 && PrevTryIncJ == 0) ? Sgn(CurDeltaI) : PrevTryIncI;
+      int prevJ = (PrevTryIncI == 0 && PrevTryIncJ == 0) ? Sgn(CurDeltaJ) : PrevTryIncJ;
+      int incI[] = { prevI, Sgn( prevI + prevJ), Sgn(prevI - prevJ) };
+      int incJ[] = { prevJ, Sgn(-prevI + prevJ), Sgn(prevI + prevJ) };
+      int idx[] = { 0, 1, 2 };
+      CurNrTries = 3;
+      if (Dbg) {
+         sprintf(DbgMsg, "SetNextSteps before: CurNrTries %d\n", CurNrTries); DbgTxt += DbgMsg;
+         for (int k = 0; k < CurNrTries; ++k) {
+            sprintf(DbgMsg, "%d %d,", incI[k], incJ[k]); DbgTxt += DbgMsg;
+         }
+         DbgTxt += "\n";
+      }
+      // Assumption: Only one direction can be opposite of escape direction
+      if (incI[1] * CurDeltaI < 0 || incJ[1] * CurDeltaJ < 0) {
+         incI[1] = incI[2];
+         incJ[1] = incJ[2];
+         --CurNrTries;
+      }
+      else if (incI[2] * CurDeltaI < 0 || incJ[2] * CurDeltaJ < 0)
+         --CurNrTries;
+      // If direction exactly matches to escape direction take this one first !
+      for (int k = 1; k < CurNrTries; ++k)
+         if (Sgn(incI[k]) == Sgn(CurDeltaI) && Sgn(incJ[k]) == Sgn(CurDeltaJ)) { // Sgn would be obsolete if all normed
+            idx[0] = k;
+            idx[k] = 0;
+            break;
+         }
+      // If direction is orthogonal (only one) make it the last one !
+      for (k = 0; k < CurNrTries; ++k)
+         if (incI[idx[k]] * CurDeltaI + incJ[idx[k]] * CurDeltaJ == 0) {
+            int t = idx[k];
+            idx[k] = idx[CurNrTries - 1];
+            idx[CurNrTries - 1] = t;
+         }
+      for (k = 0; k < CurNrTries; ++k) {
+         CurTryIncI[k] = incI[idx[k]];
+         CurTryIncJ[k] = incJ[idx[k]];
+      }
+   }
+   if (Dbg) {
+      sprintf(DbgMsg, "SetNextSteps: CurNrTries %d\n", CurNrTries); DbgTxt += DbgMsg;
+      for (int k = 0; k < CurNrTries; ++k) {
+         sprintf(DbgMsg, "%d %d,", CurTryIncI[k], CurTryIncJ[k]); DbgTxt += DbgMsg;
+      }
+      DbgTxt += "\n";
+   }
+}
+
+// Important: (i,j) must be a BORDER POINT !
+int EscapeVec(int i, int j, int dim) {
+   int k, l;
+   if (i == 0 && j > 0) k = -EscapeDist;
+   else if (i <  NrGridX - 1 && j == 0) l = -EscapeDist;
+   else if (i == NrGridX - 1 && j < NrGridY - 1) k = EscapeDist;
+   else l = EscapeDist;
+   int rowOffs = (dim == DIM_X) ? 0 : 2;
+   if (Dbg) {
+      int tr = round(Lbr2BrdRot[rowOffs] * k + Lbr2BrdRot[rowOffs + 1] * l);
+      sprintf(DbgMsg, "EscapeVec: i,j,k,l,dim: tr: (%d %d) (%f %f) %d: %f)\n",i, j, u2mm(k), u2mm(l), dim, u2mm(tr)); DbgTxt += DbgMsg;
+   }
+   return round(Lbr2BrdRot[rowOffs] * k + Lbr2BrdRot[rowOffs + 1] * l);
+}
+
+void Execute() {
+   output(ScrFile, "wt")
+      for (int i = 0; i < NrElems; ++i) {
+         board(B)  B.elements(E)
+            if (E.name == ElemNames[i]) {
+               ViaDiam = GetViaDiam(ViaDrill);
+               MicroViaDiam = MicroViaDrill + min(max(RestFacMicroVia * MicroViaDrill, RestMinMicroVia), RestMaxMicroVia) * 2; // same like GetViaDiam
+               if (UseNetClasses) IncludeClasses();
+               InitGrid();
+               printf("CHANGE SHAPE round;\n");
+               printf("SET WIRE_BEND 2;\n");  // 2 necessary for rotations != k * 45�
+               int conCnt = 0;
+               for (CurTraverse = false, SetNextConPos(); CurGridX != INVALID_POS; SetNextConPos()) { // Achte auf i !
+                  string statMsg;
+                  sprintf(statMsg, "Processing %d of %d contacts...", ++conCnt, ElemRouteAll ? NrCons : NrConsWithSig);
+                  status(statMsg);
+                  if (Dbg) { DbgTxt += statMsg; DbgDump(); }
+                  for (int lay = 0, noRoute = false; lay < NrLayers && !CurEscaped && !noRoute; ++lay) {
+                     int curTryI = (CurTakeBone) ? CurBoneX : CurGridX, curTryJ = (CurTakeBone) ? CurBoneY : CurGridY;
+                     int tryI[] = { curTryI }, tryJ[] = { curTryJ };
+                     int nrTryPts = 1, trapped = false;
+                     int viaTrial = false, routeType = WIRE;
+                     if (Dbg) {
+                        sprintf(DbgMsg, "%s: Contact (%d %d), Layer %d", ElemNames[i], CurGridX, CurGridY, lay);
+                        DbgTxt += DbgMsg + "\n"; DbgDump();
+                     }
+                     PrevTryIncI = PrevTryIncJ = 0;
+                     if (lay == 0)
+                        CurEscaped = (BorderDist(CurGridX, CurGridY) == 0);
+                     while (!(trapped || CurEscaped)) {
+                        if (!viaTrial) SetNextSteps();
+                        int tryIncI, tryIncJ;
+                        if ((TryRoute(lay, curTryI, curTryJ, tryIncI = CurTryIncI[0], tryIncJ = CurTryIncJ[0], routeType, true) > 0) ||
+                            (CurNrTries > 1 &&
+                             (TryRoute(lay, curTryI, curTryJ, tryIncI = CurTryIncI[1], tryIncJ = CurTryIncJ[1], routeType, true) > 0)) ||
+                            (CurNrTries > 2 &&
+                             (TryRoute(lay, curTryI, curTryJ, tryIncI = CurTryIncI[2], tryIncJ = CurTryIncJ[2], routeType, true) > 0))) {
+                           tryI[nrTryPts] = TryI;
+                           tryJ[nrTryPts++] = TryJ;
+                           curTryI = TryI;
+                           curTryJ = TryJ;
+                           PrevTryIncI = tryIncI;
+                           PrevTryIncJ = tryIncJ;
+                           routeType = WIRE; // In any case continue with WIRE !
+                           if (Dbg) DbgDump();
+                        }
+                        else if (ElemViaStrat == BONES && lay == 0 && nrTryPts >= 2 && !viaTrial) {
+                           routeType = VIA;
+                           nrTryPts = 1;
+                           curTryI = CurGridX;
+                           curTryJ = CurGridY;
+                           tryI[0] = curTryI;
+                           tryJ[0] = curTryJ;
+                           PrevTryIncI = PrevTryIncJ = 0;
+                           CurTryIncI[0] = CurDeltaI;
+                           CurTryIncJ[0] = CurDeltaJ;
+                           CurTryIncI[1] = Sgn( CurDeltaI + CurDeltaJ);
+                           CurTryIncJ[1] = Sgn(-CurDeltaI + CurDeltaJ);
+                           CurNrTries = 2;
+                           viaTrial = true;
+                        }
+                        else
+                           trapped = true;
+                     }
+                     if (CurEscaped || (lay == 0 && ElemViaStrat == BONES)) {
+                        int cIdx = ConIdx(CurGridX, CurGridY);
+                        real firstX = U2ExtU(CurTakeBone ? LbrGrid2BrdCoord(CurBoneX, CurBoneY, DIM_X) : ConXs[cIdx]);
+                        real firstY = U2ExtU(CurTakeBone ? LbrGrid2BrdCoord(CurBoneX, CurBoneY, DIM_Y) : ConYs[cIdx]);
+                        real outWireWidth = U2ExtU(UseNetClasses ? ClassAdjWidths[ConClassIds[cIdx]] : WireWidth) ;
+                        real outViaDrill = U2ExtU(ElemViaStrat == STACKED_VIAS ? MicroViaDrill :
+                                                  UseNetClasses ? ClassAdjDrills[ConClassIds[cIdx]] : ViaDrill);
+                        if (Dbg) {
+                           sprintf(DbgMsg, "Output: cIdx %d \n", cIdx); DbgTxt += DbgMsg;
+                           if (UseNetClasses) {
+                              sprintf(DbgMsg, "ConClassIds[cIdx] %d ClassWidths[ConClassIds[cIdx]] %f "
+                                              "ClassDrills[ConClassIds[cIdx]] %f\n", ConClassIds[cIdx],
+                                              u2mm(ClassAdjWidths[ConClassIds[cIdx]]), u2mm(ClassAdjDrills[ConClassIds[cIdx]]));
+                              DbgTxt += DbgMsg;
+                           }
+                           DbgDump();
+                        }
+                        string sig = ConSigNames[cIdx];
+                        if (sig == "") sig = NewSigName();
+                        if (Dbg) { sprintf(DbgMsg, "Escaped, after NewSigName\n"); DbgTxt += DbgMsg; DbgDump(); }
+
+                        if (CurEscaped) {
+                           printf("LAYER %d;\n", Layer(lay));  // Evtl. nach vias
+                           if (lay > 0) {
+                              printf("CHANGE DRILL %f;\n", outViaDrill);
+                              printf("VIA '%s'", sig);
+                              if (ElemViaStrat == STACKED_VIAS) {
+                                 for (int l = 1; l <= lay; ++l)
+                                    printf(" %d-%d (%f %f)", Layer(l - 1), Layer(l), firstX, firstY);
+                                 printf(";\n");
+                              }
+                              else {
+                                 for (int l = 1; l <= lay; ++l) {
+                                    SetGridRouteState(l, CurBoneX, CurBoneY, VIA);
+                                    SetGridRouteState(l, CurBoneX - 1, CurBoneY    , NEAR_VIA);
+                                    SetGridRouteState(l, CurBoneX + 1, CurBoneY    , NEAR_VIA);
+                                    SetGridRouteState(l, CurBoneX    , CurBoneY - 1, NEAR_VIA);
+                                    SetGridRouteState(l, CurBoneX    , CurBoneY + 1, NEAR_VIA);
+                                 }
+                                 printf(" %d-%d (%f %f);\n", Layer(0), Layer(lay), // Durchkontaktierung ?
+                                        U2ExtU(LbrGrid2BrdCoord(CurBoneX, CurBoneY, DIM_X)),
+                                        U2ExtU(LbrGrid2BrdCoord(CurBoneX, CurBoneY, DIM_Y)));
+                              }
+                           }
+                           if (Dbg) { sprintf(DbgMsg, "Escaped, wire\n"); DbgTxt += DbgMsg; DbgDump(); }
+                           printf("WIRE '%s' %f (%f %f)", sig, outWireWidth, firstX, firstY);
+                           SetGridRouteState(lay, tryI[0], tryJ[0], WIRE); // Is VIA getting overridden ?
+                           for (int i = 1; i < nrTryPts; ++i) {
+                              // Mark wire
+                              int incI = Sgn(tryI[i] - tryI[i - 1]), incJ = Sgn(tryJ[i] - tryJ[i - 1]);
+                              // Put this together if no performance reasons against it  !
+                              if (abs(tryI[i] - tryI[i - 1]) > 1 || abs(tryJ[i] - tryJ[i - 1]) > 1) {
+                                 for (int k = tryI[i - 1] + incI, l = tryJ[i - 1] + incJ;
+                                      (tryI[i] - k) * incI >= 0 && (tryJ[i] - l) * incJ >= 0; k += incI, l += incJ) {
+                                    if (Dbg) { sprintf(DbgMsg, "k %d l %d ", k, l); DbgTxt += DbgMsg; DbgDump(); }
+                                    SetGridRouteState(lay, k, l, WIRE);
+                                    if (incI * incJ != 0) {
+                                       SetGridRouteState(lay, k - incI, l,        NEAR_WIRE);
+                                       SetGridRouteState(lay, k       , l - incJ, NEAR_WIRE);
+                                    }
+                                 }
+                              }
+                              else {
+                                 SetGridRouteState(lay, tryI[i], tryJ[i], WIRE);
+                                 if (incI * incJ != 0) {
+                                    SetGridRouteState(lay, tryI[i - 1] + incI, tryJ[i - 1],        NEAR_WIRE);
+                                    SetGridRouteState(lay, tryI[i - 1],        tryJ[i - 1] + incJ, NEAR_WIRE);
+                                 }
+                              }
+                              printf(" (%f %f)", U2ExtU(LbrGrid2BrdCoord(tryI[i], tryJ[i], DIM_X)),
+                                                 U2ExtU(LbrGrid2BrdCoord(tryI[i], tryJ[i], DIM_Y)));
+                           }
+                           // The escape wire !
+                           if (Dbg) { sprintf(DbgMsg, "Escaped, wire outside\n"); DbgTxt += DbgMsg; DbgDump(); }
+                           int lastI = tryI[nrTryPts - 1], lastJ = tryJ[nrTryPts - 1];
+                           printf(" (%f %f);\n", U2ExtU(LbrGrid2BrdCoord(lastI, lastJ, DIM_X) + EscapeVec(lastI, lastJ, DIM_X)),
+                                                 U2ExtU(LbrGrid2BrdCoord(lastI, lastJ, DIM_Y) + EscapeVec(lastI, lastJ, DIM_Y)));
+                        }
+                        else if (nrTryPts >= 2) {
+                           if (Dbg) { sprintf(DbgMsg, "Bone-Stuff start\n"); DbgTxt += DbgMsg; DbgDump(); }
+                           int incI = tryI[1] - tryI[0], incJ = tryJ[1] - tryJ[0];
+                           printf("LAYER %d;\n", Layer(0));
+                           printf("WIRE '%s' %f (%f %f) (%f %f);\n", sig, outWireWidth, firstX, firstY,
+                                  U2ExtU(LbrGrid2BrdCoord(tryI[1], tryJ[1], DIM_X)),
+                                  U2ExtU(LbrGrid2BrdCoord(tryI[1], tryJ[1], DIM_Y)));
+                           // Assume this is a single diagonal step !
+                           SetGridRouteState(lay, tryI[1], tryJ[1], WIRE);
+                           if (incI * incJ != 0) { // Incs not necessary here !
+                              SetGridRouteState(lay, tryI[1], tryJ[0], NEAR_WIRE);
+                              SetGridRouteState(lay, tryI[0], tryJ[1], NEAR_WIRE);
+                           }
+                           CurBoneX = tryI[1];
+                           CurBoneY = tryJ[1];
+                           CurTakeBone = true;
+                           ConSigNames[cIdx] = sig;
+                           if (Dbg) { sprintf(DbgMsg, "Bone-Stuff end\n"); DbgTxt += DbgMsg; DbgDump(); }
+                        }
+                        else
+                           noRoute = true;
+                     }
+                  }
+               }
+               printf("SET WIRE_BEND 3;\n");  // Limit to  k * 45� again.
+            }
+      }
+   DbgDump();
+   if (Dbg) dlgMessageBox("Calculation done !");
+   exit("SCRIPT '" + ScrFile + "';");
+}
+
+//==============================================================================
+// Main
+//==============================================================================
+/*
+*/
+
+void main() {
+   string help[] = {
+      "<h3>BGA Escape Routing</h3>"
+      "Based on design rules an attempt is made to route all signals out of a BGA.<br>"
+      "The package must follow a BGA design, meaning:<ul>"
+      "<li> It is an SMD.</li>"
+      "<li> All contacts have circular shape.</li>"
+      "<li> All contacts lie on a grid (same distance dx and dy).</li>"
+      "</ul>"
+      "This is checked before start. "
+      "All signals starting from the BGA should not be routed yet."
+      "<p>"
+      "<b>BGA analysis</b><br>"
+      "Before start a feasibility analysis is made that helps you determine appropriate sizes "
+      "and strategy. It is based on design rule settings, in particular: "
+      "Minimum wire width, minimum via sizes, via restring settings, clearances between wires, "
+      "pads and vias. Please make sure your design rules are correct to get accurate results."
+      "<p>"
+      "<b>Wire and via sizes</b><br>"
+      "Wire and via sizes can either be taken over from the net classes of the connected signals or "
+      "specific values may be set. In any case they are limited by the minimum values of the design rules."
+      "<p>"
+      "<b>Via strategy</b><br>"
+      "There is the classical bone technique or stacked micro vias. "
+      "The bone technique requires space for one trace between 2 neighbour contacts."
+      "The BGA analysis checks this. For stacked micro vias the design rules's layer setup must fit."
+      "The micro via drill size is independent from net class values."
+      "<p>"
+      "<b>Coverage</b><br>"
+      "By default only contacts with signals are routed. If you want all signals, check the "
+      "radio button in the coverage section."
+      "<p>"
+      "Finally, the <i>escape distance</i> specifies how far the signals are routed out of the BGA (default 5mm)."
+      ,
+      "<h3>BGA Escape Routing</h3>"
+      "Unter Berücksichtigung der Design-Regeln wird versucht, alle Signale aus einem BGA herauszuführen.<br>"
+      "Das Package muss einem BGA-Design entsprechen. Das heisst:<ul>"
+      "<li> Es ist ein SMD.</li>"
+      "<li> Alle Anschlüsse sind kreisförmig.</li>"
+      "<li> Alle Anschlüsse liegen in einem gemeinsamen Raster (gleicher Wert für dx und dy).</li>"
+      "</ul>"
+      "Diese Kriterien werden vor dem Start geprüft. "
+      "Alle Signale, die am BGA beginnen, sollten noch nicht geroutet sein."
+      "<p>"
+      "<b>BGA-Analyse</b><br>"
+      "Zuerst wird eine Machbarkeitsanalyse durchgeführt, die helfen soll, die passenden Größen "
+      "und die Strategie zu wählen. Diese basiert auf den Werten in den Design-Regeln, insbesondere: "
+      "Minimum Wire Width, Minimum Via Sizes, Via-Restring-Einstellungen, Mindestabstände zwischen Wires, "
+      "Pads und Vias. Bitte stellen Sie sicher, dass die Design-Regeln geeignet gewählt sind, um gute Ergebnisse zu erzielen."
+      "<p>"
+      "<b>Wire- und Via-Größen</b><br>"
+      "Die Wire- und Via-Größen können entweder von den Netzklassen der angeschlossenen Signale übernommen "
+      "oder spezifische Werte gesetzt werden. In jedem Fall werden sie von den Minimum-Werten in den Design-Regeln begrenzt."
+      "<p>"
+      "<b>Via-Strategie</b><br>"
+      "Es gibt die klassische Knochentechnik oder Stacked Micro-Vias. "
+      "Die Knochentechnik benötigt genügend Platz für eine Leitung zwischen zwei benachbarten Kontakten. "
+      "Die BGA-Aanalyse prüft dies. Für Stacked Micro-Vias muss das Layer-Setup in den Design-Regeln stimmen. "
+      "Der Bohrdurchmesser der Micro-Vias ist ein eigener Wert und hat nichts mit den Netzklassen-Werten zu tun. "
+      "<p>"
+      "<b>Abdeckung</b><br>"
+      "Standardmäßig werden nur Kontakte mit Signalen bearbeitet. Wenn alle Kontakte geroutet werden sollen, "
+      "wählen Sie diese Option unter Abdeckung."
+      "<p>"
+      "Die <i>Escape-Distanz</i> schliesslich definiert, wie weit die Signale aus dem BGA herausgeführt werden (Default 5mm)."
+   };
+   if (Dbg) DbgFile = filesetext(argv[0], "-dbg.txt");
+   DbgInit();
+   if (board) {
+      int i, dummySel, dummySort;
+      // Prepare step: Export DRUs if necessary
+      for (i = 1; i <= argc; ++i)
+          if (argv[i] == "-drus_done") ExpDRUs = false;
+      board(B) DruFile = filesetext(B.name, ".dru");
+      if (ExpDRUs) {
+         string cmds = "DRC SAVE '" + DruFile + "';\nRUN '" + argv[0] + "' -drus_done";
+         for (int i = 1; i <= argc; ++i)
+             cmds += " " +  argv[i];
+         exit(cmds + ";");
+      }
+      GetDesignParams();
+      // Parse arguments. Design params may get overwritten.
+      // Note: Only element name is officially supported !
+      // Currently other params just for internal use in batch mode.
+      for (i = 1; i < argc; ++i) {
+         if (argv[i] == "-drus_done") ExpDRUs = false;
+         else if (argv[i] == "-nodlg") { Dialog = false; Dbg = false; }
+         else if (argv[i] == "-stacked") ElemViaStrat = STACKED_VIAS;
+         else if (argv[i] == "-classes") UseNetClasses = true;
+         else if (argv[i] == "-all") ElemRouteAll = true;
+         else if (strstr(argv[i], "-width=") == 0)
+            WireWidth = Str2U(strsub(argv[i], strlen("-width=")));
+         else if (strstr(argv[i], "-esc=") == 0)
+            EscapeDist = Str2U(strsub(argv[i], strlen("-esc=")));
+         else if (strstr(argv[i], "-drill=") == 0)
+            ViaDrill = MicroViaDrill = Str2U(strsub(argv[i], strlen("-drill=")));
+         else ElemNames[NrElems++] = strupr(argv[i]);  // Ignore case !
+      }
+      if (ElemNames[0] == "" || NrElems > 1) { // We may allow multiple BGAs in the future.
+         dlgMessageBox(usage);
+         exit(-1);
+      }
+      board(B) {
+         ScrFile = filesetext(B.name, "-bga.scr");
+         ExtUnit = B.grid.unit;
+      }
+      ExtUnitName = (ExtUnit == GRID_UNIT_MM)   ? "mm"  :
+                    (ExtUnit == GRID_UNIT_INCH) ? "in"  :
+                    (ExtUnit == GRID_UNIT_MIC)  ? "mic" : "mil";
+      SetupElement(ElemNames[0]);
+
+      if (Dialog) int ret = dlgDialog("BGA Escape Routing") {
+         real dlgWireWidth = U2ExtU(WireWidth);
+         real dlgEscapeDist = U2ExtU(EscapeDist);
+         real dlgViaDrill = U2ExtU(ViaDrill);
+         real dlgMicroViaDrill = U2ExtU(MicroViaDrill);
+         real dlgMinViaDrill = 0.999 * U2ExtU(MinViaDrill);
+         real dlgMinMicroViaDrill = 0.999 * U2ExtU(min(MinMicroViaDrill, MinViaDrill));
+         if (Dbg) dlgCheckBox("&Debug", Dbg);
+         dlgGroup(tr("BGA analysis for ") + ElemName +":") {
+            string analysis = "<ul>"
+               "<li>" + tr("Number of contacts: ") + I2Str(NrCons) + " (" + I2Str(NrConsWithSig) + " " + tr("with signals") + ")." + "</li>"
+               "<li>" + tr("Contact diameter: ") + U2ExtUStr(ConDiam) + "." + "</li>"
+               "<li>" + tr("Contact distance: ") + U2ExtUStr(ConDist) + "." + "</li>"
+               "<li>" + tr("Maximum wire width for one wire between contacts: ") + U2ExtUStr(MaxWireWidth1) + ".";
+            if (MaxWireWidth1 < MinWireWidth)
+               analysis += "<br> " + tr("Not enough space for wires between contacts. ") + tr("Stacked micro vias recommended !");
+            analysis += "</li>";
+            analysis += "<li>" + tr("Maximum via drill for bone technique: ") + U2ExtUStr(MaxViaDrill) + ".";
+            if (MaxViaDrill < MinViaDrill)
+               analysis += "<br> " + tr("Not enough space for vias between contacts. ") +  tr("Stacked micro vias recommended !");
+            analysis += "</li>";
+            analysis += "</ul>";
+            dlgLabel(analysis);
+         }
+         dlgHBoxLayout {
+            // Gruppe Wire width: Radiobutton mit RealEdit daneben...
+            dlgGroup(tr("Wire and via sizes:")) {
+               dlgHBoxLayout {
+                  dlgRadioButton(tr("Use specific sizes:"), UseNetClasses);
+                  dlgLabel(tr("Wire width:"));
+                  // Upper limit ConDist: Just to have a rough limit. Exact maximum would depend
+                  // on strategy and DRU settings.
+                  dlgRealEdit(dlgWireWidth, U2ExtU(MinWireWidth), U2ExtU(ConDist));
+                  dlgLabel(ExtUnitName);
+                  dlgLabel(tr("Via drill size:"));
+                  dlgRealEdit(dlgViaDrill, dlgMinViaDrill, U2ExtU(ConDist + ConDiam)); // Upper limit: Just to have a rough limit. See above.
+                  dlgLabel(ExtUnitName);
+               }
+               dlgRadioButton(tr("Use net classes"), UseNetClasses);
+            }
+         }
+         dlgGroup(tr("Via strategy")) {
+            dlgRadioButton(tr("Make bones"), ElemViaStrat);
+            dlgHBoxLayout {
+               dlgRadioButton(tr("Stacked micro vias:"), ElemViaStrat);
+               dlgLabel(tr("Micro via drill size:"));
+               dlgRealEdit(dlgMicroViaDrill, dlgMinMicroViaDrill, U2ExtU(ConDiam)); // Upper limit: Rough value
+               dlgLabel(ExtUnitName);
+               dlgStretch(2);
+            }
+         }
+         dlgGroup(tr("Coverage")) {
+            dlgRadioButton(tr("Contacts with signals"), ElemRouteAll);
+            dlgRadioButton(tr("All contacts"), ElemRouteAll);
+         }
+         dlgHBoxLayout {
+            dlgLabel(tr("Escape distance: "));
+            dlgRealEdit(dlgEscapeDist, 0, 1000);
+            dlgLabel(ExtUnitName);
+            dlgStretch(3);
+         }
+         dlgHBoxLayout {
+            dlgPushButton(tr("Help") + "...")
+               dlgMessageBox(DlgLang == "de" ? help[1] : help[0]);  // Adjust after translation !
+            dlgPushButton(tr("Start")) {
+               EscapeDist = ExtU2U(dlgEscapeDist);
+               MicroViaDrill = ExtU2U(dlgMicroViaDrill);
+               if (!UseNetClasses) {
+                  WireWidth = ExtU2U(dlgWireWidth);
+                  ViaDrill = ExtU2U(dlgViaDrill);
+               }
+               Execute();
+            }
+            dlgPushButton(tr("Cancel")) dlgReject();
+         }
+      };  // <-- This must be here ! (Ulp-Bug ?)
+      else
+         Execute();
+   }
+   else
+      dlgMessageBox(tr("Please start from Layout editor !"));
+}
